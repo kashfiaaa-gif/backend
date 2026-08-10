@@ -1,45 +1,23 @@
+require("dotenv").config();
+
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const pool = require("./db");
 
 const app = express();
 app.use(express.json());
 
-// Secret key (later move this to .env)
-const JWT_SECRET = "change-this-later-to-something-secret";
-
 
 // ======================
 // Temporary "Databases"
+// (Notes, bookmarks, and progress are still in-memory for now —
+// next step is converting these to real DB tables too.)
 // ======================
 
-// Resources
-let resources = [
-  {
-    id: 1,
-    topic: "Web Development",
-    type: "YouTube",
-    title: "Intro to HTML",
-    link: "https://example.com"
-  }
-];
-
-// Users — starts empty. A single admin account gets seeded in below,
-// right before the server starts listening, so its password is always
-// a real, correctly-generated hash rather than something hardcoded.
-let users = [];
-
-// Notes — each note is tied to a userId, so users only ever see their own
 let notes = [];
-
-// Bookmarks — each bookmark ties a userId to a resourceId
 let bookmarks = [];
-
-// Progress — each entry marks a topic as completed for a specific userId
 let progress = [];
-
-// Roadmaps — created by admins/faculty, viewable by everyone
-let roadmaps = [];
 
 
 // ======================
@@ -54,7 +32,7 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: "No token provided" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       return res.status(403).json({ error: "Invalid or expired token" });
     }
@@ -82,266 +60,285 @@ app.get("/", (req, res) => {
 
 
 // ======================
-// Resource Routes
+// Results Routes (roadmap + AI notes for a topic)
 // ======================
 
-// Get all resources (or by topic) — open to everyone, no login needed
-app.get("/api/resources", (req, res) => {
-  const topic = req.query.topic;
+// Create a topic result — admin only
+app.post("/api/results", authenticateToken, requireAdmin, async (req, res) => {
+  const { topic_name, roadmap, ai_notes } = req.body;
 
-  if (topic) {
-    const filtered = resources.filter(
-      r => r.topic.toLowerCase() === topic.toLowerCase()
-    );
-    return res.json(filtered);
-  }
-
-  res.json(resources);
-});
-
-// Add a new resource — admin only
-app.post("/api/resources", authenticateToken, requireAdmin, (req, res) => {
-  const newResource = {
-    id: resources.length + 1,
-    addedBy: req.user.email,
-    ...req.body
-  };
-
-  resources.push(newResource);
-  res.status(201).json(newResource);
-});
-
-
-// ======================
-// Notes Routes
-// ======================
-
-// Create a note — tied to whoever is logged in
-app.post("/api/notes", authenticateToken, (req, res) => {
-  const { topic, content } = req.body;
-
-  const newNote = {
-    id: notes.length + 1,
-    userId: req.user.id,
-    topic,
-    content,
-    createdAt: new Date()
-  };
-
-  notes.push(newNote);
-  res.status(201).json(newNote);
-});
-
-// Get only the logged-in user's own notes
-app.get("/api/notes", authenticateToken, (req, res) => {
-  const myNotes = notes.filter(note => note.userId === req.user.id);
-  res.json(myNotes);
-});
-
-
-// ======================
-// Bookmark Routes
-// ======================
-
-// Bookmark a resource — tied to whoever is logged in
-app.post("/api/bookmarks", authenticateToken, (req, res) => {
-  const { resourceId } = req.body;
-
-  const resourceExists = resources.find(r => r.id === resourceId);
-  if (!resourceExists) {
-    return res.status(404).json({ error: "Resource not found" });
-  }
-
-  const alreadyBookmarked = bookmarks.find(
-    b => b.userId === req.user.id && b.resourceId === resourceId
+  const [result] = await pool.query(
+    "INSERT INTO saved_results (user_id, topic_name, roadmap, ai_notes) VALUES (?, ?, ?, ?)",
+    [req.user.id, topic_name, roadmap, ai_notes]
   );
-  if (alreadyBookmarked) {
-    return res.status(400).json({ error: "Already bookmarked" });
-  }
 
-  const newBookmark = {
-    id: bookmarks.length + 1,
-    userId: req.user.id,
-    resourceId,
-    createdAt: new Date()
-  };
-
-  bookmarks.push(newBookmark);
-  res.status(201).json(newBookmark);
+  res.status(201).json({
+    result_id: result.insertId,
+    topic_name,
+    roadmap,
+    ai_notes
+  });
 });
 
-// Get the logged-in user's bookmarks, with full resource details attached
-app.get("/api/bookmarks", authenticateToken, (req, res) => {
-  const myBookmarks = bookmarks
-    .filter(b => b.userId === req.user.id)
-    .map(b => {
-      const resource = resources.find(r => r.id === b.resourceId);
-      return { ...b, resource };
-    });
-
-  res.json(myBookmarks);
-});
-
-
-// ======================
-// Progress Tracking Routes
-// ======================
-
-// Mark a topic as completed — tied to whoever is logged in
-app.post("/api/progress", authenticateToken, (req, res) => {
-  const { topic } = req.body;
-
-  const alreadyDone = progress.find(
-    p => p.userId === req.user.id && p.topic === topic
+// List all topic results — open to everyone (just id + name, for browsing)
+app.get("/api/results", async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT result_id, topic_name FROM saved_results"
   );
-  if (alreadyDone) {
-    return res.status(400).json({ error: "Topic already marked complete" });
-  }
-
-  const newProgress = {
-    id: progress.length + 1,
-    userId: req.user.id,
-    topic,
-    completedAt: new Date()
-  };
-
-  progress.push(newProgress);
-  res.status(201).json(newProgress);
+  res.json(rows);
 });
 
-// Get the logged-in user's completed topics + overall progress percentage
-app.get("/api/progress", authenticateToken, (req, res) => {
-  const myProgress = progress.filter(p => p.userId === req.user.id);
+// Get one topic result in full, with its resources — requires login
+// (also logs this lookup to search_history)
+app.get("/api/results/:resultId", authenticateToken, async (req, res) => {
+  const { resultId } = req.params;
 
-  const percentage = resources.length
-    ? Math.round((myProgress.length / resources.length) * 100)
-    : 0;
+  const [resultRows] = await pool.query(
+    "SELECT * FROM saved_results WHERE result_id = ?",
+    [resultId]
+  );
+
+  if (resultRows.length === 0) {
+    return res.status(404).json({ error: "Result not found" });
+  }
+
+  const result = resultRows[0];
+
+  const [resourceRows] = await pool.query(
+    "SELECT * FROM resources WHERE result_id = ?",
+    [resultId]
+  );
+
+  await pool.query(
+    "INSERT INTO search_history (user_id, topic_name) VALUES (?, ?)",
+    [req.user.id, result.topic_name]
+  );
 
   res.json({
-    completedTopics: myProgress,
-    totalCompleted: myProgress.length,
-    progressPercentage: percentage
+    ...result,
+    resources: resourceRows
   });
 });
 
 
 // ======================
-// Roadmap Routes
+// Resource Routes (attached to a specific result)
 // ======================
 
-// Get all roadmaps — open to everyone
-app.get("/api/roadmaps", (req, res) => {
-  res.json(roadmaps);
+// Attach a resource to a topic result — admin only
+app.post("/api/results/:resultId/resources", authenticateToken, requireAdmin, async (req, res) => {
+  const { resultId } = req.params;
+  const { resource_type, resource_title, resource_link } = req.body;
+
+  const [resultRows] = await pool.query(
+    "SELECT * FROM saved_results WHERE result_id = ?",
+    [resultId]
+  );
+
+  if (resultRows.length === 0) {
+    return res.status(404).json({ error: "Result not found" });
+  }
+
+  const [inserted] = await pool.query(
+    "INSERT INTO resources (result_id, resource_type, resource_title, resource_link) VALUES (?, ?, ?, ?)",
+    [resultId, resource_type, resource_title, resource_link]
+  );
+
+  res.status(201).json({
+    resource_id: inserted.insertId,
+    result_id: resultId,
+    resource_type,
+    resource_title,
+    resource_link
+  });
 });
 
-// Create a roadmap — admin only
-app.post("/api/roadmaps", authenticateToken, requireAdmin, (req, res) => {
-  const newRoadmap = {
-    id: roadmaps.length + 1,
-    createdBy: req.user.email,
-    ...req.body
-  };
 
-  roadmaps.push(newRoadmap);
-  res.status(201).json(newRoadmap);
+// ======================
+// Notes Routes (still in-memory — next to convert)
+// ======================
+
+app.post("/api/notes", authenticateToken, async (req, res) => {
+  const { topic, content } = req.body;
+
+  const [result] = await pool.query(
+    "INSERT INTO notes (user_id, topic_name, note) VALUES (?, ?, ?)",
+    [req.user.id, topic, content]
+  );
+
+  res.status(201).json({
+    note_id: result.insertId,
+    topic_name: topic,
+    note: content
+  });
 });
 
+app.get("/api/notes", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM notes WHERE user_id = ?",
+    [req.user.id]
+  );
+  res.json(rows);
+});
 
 // ======================
-// User Authentication
+// Bookmark Routes (still in-memory — next to convert)
+// Resource existence is now checked against the real DB.
 // ======================
 
-// Register — always creates a regular "student" account.
-// (Admins are seeded separately, not created through this route.)
-app.post("/api/register", async (req, res) => {
-  const { email, password } = req.body;
+app.post("/api/bookmarks", authenticateToken, async (req, res) => {
+  const { resourceId } = req.body;
 
-  const existing = users.find(user => user.email === email);
+  const [resourceRows] = await pool.query(
+    "SELECT * FROM resources WHERE resource_id = ?",
+    [resourceId]
+  );
+  if (resourceRows.length === 0) {
+    return res.status(404).json({ error: "Resource not found" });
+  }
 
-  if (existing) {
-    return res.status(400).json({
-      error: "User already exists"
+  try {
+    const [result] = await pool.query(
+      "INSERT INTO bookmarks (user_id, resource_id) VALUES (?, ?)",
+      [req.user.id, resourceId]
+    );
+
+    res.status(201).json({
+      bookmark_id: result.insertId,
+      resource: resourceRows[0]
     });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ error: "Already bookmarked" });
+    }
+    throw err;
+  }
+});
+
+app.get("/api/bookmarks", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT bookmarks.bookmark_id, bookmarks.bookmarked_at, resources.*
+     FROM bookmarks
+     JOIN resources ON bookmarks.resource_id = resources.resource_id
+     WHERE bookmarks.user_id = ?`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+// ======================
+// Progress Tracking Routes (still in-memory — next to convert)
+// ======================
+
+app.post("/api/progress", authenticateToken, async (req, res) => {
+  const { topic } = req.body;
+
+  const [existing] = await pool.query(
+    "SELECT * FROM progress WHERE user_id = ? AND topic_name = ?",
+    [req.user.id, topic]
+  );
+  if (existing.length > 0) {
+    return res.status(400).json({ error: "Topic already tracked" });
+  }
+
+  const [result] = await pool.query(
+    "INSERT INTO progress (user_id, topic_name, status, progress_percent) VALUES (?, ?, 'Completed', 100)",
+    [req.user.id, topic]
+  );
+
+  res.status(201).json({
+    progress_id: result.insertId,
+    topic_name: topic,
+    status: "Completed"
+  });
+});
+
+app.get("/api/progress", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM progress WHERE user_id = ?",
+    [req.user.id]
+  );
+
+  const [countRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM saved_results"
+  );
+  const totalTopics = countRows[0].total;
+
+  const percentage = totalTopics
+    ? Math.round((rows.length / totalTopics) * 100)
+    : 0;
+
+  res.json({
+    completedTopics: rows,
+    totalCompleted: rows.length,
+    progressPercentage: percentage
+  });
+});
+// ======================
+// User Authentication (real MySQL database)
+// ======================
+
+app.post("/api/register", async (req, res) => {
+  const { full_name, username, email, password } = req.body;
+
+  const [existing] = await pool.query(
+    "SELECT * FROM users WHERE email = ?",
+    [email]
+  );
+
+  if (existing.length > 0) {
+    return res.status(400).json({ error: "User already exists" });
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  const newUser = {
-    id: users.length + 1,
-    email,
-    password: hashedPassword,
-    role: "student"
-  };
-
-  users.push(newUser);
+  const [result] = await pool.query(
+    "INSERT INTO users (full_name, username, email, password, role) VALUES (?, ?, ?, ?, 'student')",
+    [full_name, username, email, hashedPassword]
+  );
 
   res.status(201).json({
-    id: newUser.id,
-    email: newUser.email,
-    role: newUser.role
+    id: result.insertId,
+    email,
+    role: "student"
   });
 });
 
-
-// Login
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
 
-  const user = users.find(user => user.email === email);
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE email = ?",
+    [email]
+  );
 
-  if (!user) {
-    return res.status(401).json({
-      error: "Invalid email or password"
-    });
+  if (rows.length === 0) {
+    return res.status(401).json({ error: "Invalid email or password" });
   }
 
+  const user = rows[0];
   const match = await bcrypt.compare(password, user.password);
 
   if (!match) {
-    return res.status(401).json({
-      error: "Invalid email or password"
-    });
+    return res.status(401).json({ error: "Invalid email or password" });
   }
 
   const token = jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      role: user.role
-    },
-    JWT_SECRET,
-    {
-      expiresIn: "1h"
-    }
+    { id: user.user_id, email: user.email, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: "1h" }
   );
 
-  res.json({
-    message: "Login successful",
-    token,
-    role: user.role
-  });
+  res.json({ message: "Login successful", token, role: user.role });
 });
 
 
 // ======================
-// Seed one admin account, then start the server
+// Start Server
 // ======================
 
-async function start() {
-  const adminPassword = await bcrypt.hash("admin123", 10);
+const PORT = 3000;
 
-  users.push({
-    id: 1,
-    email: "admin@noetra.com",
-    password: adminPassword,
-    role: "admin"
-  });
-
-  const PORT = 3000;
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log(`Seeded admin login -> email: admin@noetra.com | password: admin123`);
-  });
-}
-
-start();
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
