@@ -1,36 +1,15 @@
+require("dotenv").config();
+
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const cors = require("cors");
+const pool = require("./db");
 
 const app = express();
+
+app.use(cors());
 app.use(express.json());
-
-// Secret key (later move this to .env)
-const JWT_SECRET = "change-this-later-to-something-secret";
-
-
-// ======================
-// Temporary "Databases"
-// ======================
-
-// Resources
-let resources = [
-  {
-    id: 1,
-    topic: "Web Development",
-    type: "YouTube",
-    title: "Intro to HTML",
-    link: "https://example.com"
-  }
-];
-
-// Users — starts empty. A single admin account gets seeded in below,
-// right before the server starts listening, so its password is always
-// a real, correctly-generated hash rather than something hardcoded.
-let users = [];
-
-// Notes — each note is tied to a userId, so users only ever see their own
-let notes = [];
 
 
 // ======================
@@ -45,7 +24,7 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: "No token provided" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       return res.status(403).json({ error: "Invalid or expired token" });
     }
@@ -73,33 +52,313 @@ app.get("/", (req, res) => {
 
 
 // ======================
-// Resource Routes
+// Dashboard Route
 // ======================
 
-// Get all resources (or by topic) — open to everyone, no login needed
-app.get("/api/resources", (req, res) => {
-  const topic = req.query.topic;
+app.get("/api/dashboard", authenticateToken, async (req, res) => {
+  // Recently viewed topics — last 5 searches, most recent first
+  const [recentlyViewed] = await pool.query(
+    `SELECT topic_name, searched_at
+     FROM search_history
+     WHERE user_id = ?
+     ORDER BY searched_at DESC
+     LIMIT 5`,
+    [req.user.id]
+  );
 
-  if (topic) {
-    const filtered = resources.filter(
-      r => r.topic.toLowerCase() === topic.toLowerCase()
-    );
-    return res.json(filtered);
-  }
+  // Topics completed
+  const [completed] = await pool.query(
+    "SELECT topic_name FROM progress WHERE user_id = ?",
+    [req.user.id]
+  );
+  const completedTopics = completed.map(row => row.topic_name);
 
-  res.json(resources);
+  // Continue Learning: viewed topics that aren't in the completed list yet
+  const continueLearning = recentlyViewed.filter(
+    item => !completedTopics.includes(item.topic_name)
+  );
+
+  res.json({
+    recentlyViewed,
+    continueLearning,
+    totalCompleted: completedTopics.length
+  });
 });
 
-// Add a new resource — admin only
-app.post("/api/resources", authenticateToken, requireAdmin, (req, res) => {
-  const newResource = {
-    id: resources.length + 1,
-    addedBy: req.user.email,
-    ...req.body
-  };
 
-  resources.push(newResource);
-  res.status(201).json(newResource);
+// ======================
+// Profile Routes
+// ======================
+
+// Get the logged-in user's own profile
+app.get("/api/profile", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT user_id, full_name, username, email, role, created_at FROM users WHERE user_id = ?",
+    [req.user.id]
+  );
+
+  if (rows.length === 0) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  res.json(rows[0]);
+});
+
+// Update the logged-in user's own profile (name, username, email only)
+app.put("/api/profile", authenticateToken, async (req, res) => {
+  const { full_name, username, email } = req.body;
+
+  try {
+    await pool.query(
+      "UPDATE users SET full_name = ?, username = ?, email = ? WHERE user_id = ?",
+      [full_name, username, email, req.user.id]
+    );
+
+    res.json({
+      id: req.user.id,
+      full_name,
+      username,
+      email
+    });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ error: "That username or email is already taken" });
+    }
+    throw err;
+  }
+});
+
+
+// ======================
+// Roadmap Generator (no AI — matches against admin-curated topics)
+// ======================
+
+app.get("/api/generate-roadmap", authenticateToken, async (req, res) => {
+  const { topic } = req.query;
+
+  if (!topic) {
+    return res.status(400).json({ error: "Please provide a topic" });
+  }
+
+  const [matches] = await pool.query(
+    "SELECT * FROM saved_results WHERE topic_name LIKE ?",
+    [`%${topic}%`]
+  );
+
+  if (matches.length === 0) {
+    return res.status(404).json({
+      error: "No roadmap found for this topic yet. Try browsing available topics, or check back later."
+    });
+  }
+
+  const result = matches[0];
+
+  const [resourceRows] = await pool.query(
+    "SELECT * FROM resources WHERE result_id = ?",
+    [result.result_id]
+  );
+
+  await pool.query(
+    "INSERT INTO search_history (user_id, topic_name) VALUES (?, ?)",
+    [req.user.id, result.topic_name]
+  );
+
+  res.json({
+    ...result,
+    resources: resourceRows
+  });
+});
+
+
+// ======================
+// Smart Search
+// ======================
+
+app.get("/api/search", async (req, res) => {
+  const { q } = req.query;
+
+  if (!q) {
+    return res.status(400).json({ error: "Please provide a search term" });
+  }
+
+  const [topicMatches] = await pool.query(
+    "SELECT result_id, topic_name FROM saved_results WHERE topic_name LIKE ?",
+    [`%${q}%`]
+  );
+
+  const [resourceMatches] = await pool.query(
+    `SELECT resources.resource_id, resources.resource_title, resources.resource_type,
+            resources.resource_link, saved_results.result_id, saved_results.topic_name
+     FROM resources
+     JOIN saved_results ON resources.result_id = saved_results.result_id
+     WHERE resources.resource_title LIKE ?`,
+    [`%${q}%`]
+  );
+
+  res.json({
+    topics: topicMatches,
+    resources: resourceMatches
+  });
+});
+
+
+// ======================
+// Results Routes (roadmap + AI notes for a topic)
+// ======================
+
+// Create a topic result — admin only
+app.post("/api/results", authenticateToken, requireAdmin, async (req, res) => {
+  const { topic_name, roadmap, ai_notes, difficulty } = req.body;
+
+  const [result] = await pool.query(
+    "INSERT INTO saved_results (user_id, topic_name, roadmap, ai_notes, difficulty) VALUES (?, ?, ?, ?, ?)",
+    [req.user.id, topic_name, roadmap, ai_notes, difficulty || "Beginner"]
+  );
+
+  res.status(201).json({
+    result_id: result.insertId,
+    topic_name,
+    roadmap,
+    ai_notes,
+    difficulty: difficulty || "Beginner"
+  });
+});
+
+// List all topic results — open to everyone (just id + name, for browsing)
+// Optional ?difficulty=Beginner|Intermediate|Advanced to filter
+app.get("/api/results", async (req, res) => {
+  const { difficulty } = req.query;
+
+  const query = difficulty
+    ? "SELECT result_id, topic_name, difficulty FROM saved_results WHERE difficulty = ?"
+    : "SELECT result_id, topic_name, difficulty FROM saved_results";
+
+  const [rows] = await pool.query(query, difficulty ? [difficulty] : []);
+  res.json(rows);
+});
+
+// Get one topic result in full, with its resources — requires login
+// (also logs this lookup to search_history)
+app.get("/api/results/:resultId", authenticateToken, async (req, res) => {
+  const { resultId } = req.params;
+
+  const [resultRows] = await pool.query(
+    "SELECT * FROM saved_results WHERE result_id = ?",
+    [resultId]
+  );
+
+  if (resultRows.length === 0) {
+    return res.status(404).json({ error: "Result not found" });
+  }
+
+  const result = resultRows[0];
+
+  const [resourceRows] = await pool.query(
+    "SELECT * FROM resources WHERE result_id = ?",
+    [resultId]
+  );
+
+  await pool.query(
+    "INSERT INTO search_history (user_id, topic_name) VALUES (?, ?)",
+    [req.user.id, result.topic_name]
+  );
+
+  res.json({
+    ...result,
+    resources: resourceRows
+  });
+});
+
+// Edit a topic result — admin only
+app.put("/api/results/:resultId", authenticateToken, requireAdmin, async (req, res) => {
+  const { resultId } = req.params;
+  const { topic_name, roadmap, ai_notes, difficulty } = req.body;
+
+  const [result] = await pool.query(
+    "UPDATE saved_results SET topic_name = ?, roadmap = ?, ai_notes = ?, difficulty = ? WHERE result_id = ?",
+    [topic_name, roadmap, ai_notes, difficulty, resultId]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: "Result not found" });
+  }
+
+  res.json({ result_id: Number(resultId), topic_name, roadmap, ai_notes, difficulty });
+});
+
+
+// ======================
+// Resource Routes (attached to a specific result)
+// ======================
+
+// Attach a resource to a topic result — admin only
+app.post("/api/results/:resultId/resources", authenticateToken, requireAdmin, async (req, res) => {
+  const { resultId } = req.params;
+  const { resource_type, resource_title, resource_link } = req.body;
+
+  const [resultRows] = await pool.query(
+    "SELECT * FROM saved_results WHERE result_id = ?",
+    [resultId]
+  );
+
+  if (resultRows.length === 0) {
+    return res.status(404).json({ error: "Result not found" });
+  }
+
+  const [inserted] = await pool.query(
+    "INSERT INTO resources (result_id, resource_type, resource_title, resource_link) VALUES (?, ?, ?, ?)",
+    [resultId, resource_type, resource_title, resource_link]
+  );
+
+  res.status(201).json({
+    resource_id: inserted.insertId,
+    result_id: resultId,
+    resource_type,
+    resource_title,
+    resource_link
+  });
+});
+
+// Edit a resource — admin only
+app.put("/api/resources/:resourceId", authenticateToken, requireAdmin, async (req, res) => {
+  const { resourceId } = req.params;
+  const { resource_type, resource_title, resource_link } = req.body;
+
+  const [existing] = await pool.query(
+    "SELECT * FROM resources WHERE resource_id = ?",
+    [resourceId]
+  );
+  if (existing.length === 0) {
+    return res.status(404).json({ error: "Resource not found" });
+  }
+
+  await pool.query(
+    "UPDATE resources SET resource_type = ?, resource_title = ?, resource_link = ? WHERE resource_id = ?",
+    [resource_type, resource_title, resource_link, resourceId]
+  );
+
+  res.json({
+    resource_id: Number(resourceId),
+    resource_type,
+    resource_title,
+    resource_link
+  });
+});
+
+// Delete a resource — admin only
+app.delete("/api/resources/:resourceId", authenticateToken, requireAdmin, async (req, res) => {
+  const { resourceId } = req.params;
+
+  const [result] = await pool.query(
+    "DELETE FROM resources WHERE resource_id = ?",
+    [resourceId]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: "Resource not found" });
+  }
+
+  res.json({ message: "Resource deleted" });
 });
 
 
@@ -107,26 +366,265 @@ app.post("/api/resources", authenticateToken, requireAdmin, (req, res) => {
 // Notes Routes
 // ======================
 
-// Create a note — tied to whoever is logged in
-app.post("/api/notes", authenticateToken, (req, res) => {
+app.post("/api/notes", authenticateToken, async (req, res) => {
   const { topic, content } = req.body;
 
-  const newNote = {
-    id: notes.length + 1,
-    userId: req.user.id,
-    topic,
-    content,
-    createdAt: new Date()
-  };
+  const [result] = await pool.query(
+    "INSERT INTO notes (user_id, topic_name, note) VALUES (?, ?, ?)",
+    [req.user.id, topic, content]
+  );
 
-  notes.push(newNote);
-  res.status(201).json(newNote);
+  res.status(201).json({
+    note_id: result.insertId,
+    topic_name: topic,
+    note: content
+  });
 });
 
-// Get only the logged-in user's own notes
-app.get("/api/notes", authenticateToken, (req, res) => {
-  const myNotes = notes.filter(note => note.userId === req.user.id);
-  res.json(myNotes);
+app.get("/api/notes", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM notes WHERE user_id = ?",
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+// Delete one of the logged-in user's own notes
+app.delete("/api/notes/:noteId", authenticateToken, async (req, res) => {
+  const { noteId } = req.params;
+
+  const [result] = await pool.query(
+    "DELETE FROM notes WHERE note_id = ? AND user_id = ?",
+    [noteId, req.user.id]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+
+  res.json({ message: "Note deleted" });
+});
+
+
+// ======================
+// Bookmark Routes
+// ======================
+
+app.post("/api/bookmarks", authenticateToken, async (req, res) => {
+  const { resourceId } = req.body;
+
+  const [resourceRows] = await pool.query(
+    "SELECT * FROM resources WHERE resource_id = ?",
+    [resourceId]
+  );
+  if (resourceRows.length === 0) {
+    return res.status(404).json({ error: "Resource not found" });
+  }
+
+  try {
+    const [result] = await pool.query(
+      "INSERT INTO bookmarks (user_id, resource_id) VALUES (?, ?)",
+      [req.user.id, resourceId]
+    );
+
+    res.status(201).json({
+      bookmark_id: result.insertId,
+      resource: resourceRows[0]
+    });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ error: "Already bookmarked" });
+    }
+    throw err;
+  }
+});
+
+app.get("/api/bookmarks", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT bookmarks.bookmark_id, bookmarks.bookmarked_at, resources.*
+     FROM bookmarks
+     JOIN resources ON bookmarks.resource_id = resources.resource_id
+     WHERE bookmarks.user_id = ?`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+// Remove one of the logged-in user's own bookmarks
+app.delete("/api/bookmarks/:bookmarkId", authenticateToken, async (req, res) => {
+  const { bookmarkId } = req.params;
+
+  const [result] = await pool.query(
+    "DELETE FROM bookmarks WHERE bookmark_id = ? AND user_id = ?",
+    [bookmarkId, req.user.id]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: "Bookmark not found" });
+  }
+
+  res.json({ message: "Bookmark removed" });
+});
+
+
+// ======================
+// Progress Tracking Routes
+// ======================
+
+app.post("/api/progress", authenticateToken, async (req, res) => {
+  const { topic } = req.body;
+
+  const [existing] = await pool.query(
+    "SELECT * FROM progress WHERE user_id = ? AND topic_name = ?",
+    [req.user.id, topic]
+  );
+  if (existing.length > 0) {
+    return res.status(400).json({ error: "Topic already tracked" });
+  }
+
+  const [result] = await pool.query(
+    "INSERT INTO progress (user_id, topic_name, status, progress_percent) VALUES (?, ?, 'Completed', 100)",
+    [req.user.id, topic]
+  );
+
+  res.status(201).json({
+    progress_id: result.insertId,
+    topic_name: topic,
+    status: "Completed"
+  });
+});
+
+app.get("/api/progress", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM progress WHERE user_id = ?",
+    [req.user.id]
+  );
+
+  const [countRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM saved_results"
+  );
+  const totalTopics = countRows[0].total;
+
+  const percentage = totalTopics
+    ? Math.round((rows.length / totalTopics) * 100)
+    : 0;
+
+  res.json({
+    completedTopics: rows,
+    totalCompleted: rows.length,
+    progressPercentage: percentage
+  });
+});
+
+
+// ======================
+// Quiz Routes
+// ======================
+
+// Create a quiz — admin only
+app.post("/api/quizzes", authenticateToken, requireAdmin, async (req, res) => {
+  const { topic_name, quiz_title, description } = req.body;
+
+  const [result] = await pool.query(
+    "INSERT INTO quizzes (topic_name, quiz_title, description) VALUES (?, ?, ?)",
+    [topic_name, quiz_title, description]
+  );
+
+  res.status(201).json({
+    quiz_id: result.insertId,
+    topic_name,
+    quiz_title,
+    description
+  });
+});
+
+// Add a question to a quiz — admin only
+app.post("/api/quizzes/:quizId/questions", authenticateToken, requireAdmin, async (req, res) => {
+  const { quizId } = req.params;
+  const { question_text, option_a, option_b, option_c, option_d, correct_option } = req.body;
+
+  const [quizRows] = await pool.query("SELECT * FROM quizzes WHERE quiz_id = ?", [quizId]);
+  if (quizRows.length === 0) {
+    return res.status(404).json({ error: "Quiz not found" });
+  }
+
+  const [result] = await pool.query(
+    `INSERT INTO quiz_questions
+     (quiz_id, question_text, option_a, option_b, option_c, option_d, correct_option)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [quizId, question_text, option_a, option_b, option_c, option_d, correct_option]
+  );
+
+  res.status(201).json({ question_id: result.insertId, quiz_id: quizId, question_text });
+});
+
+// List all quizzes — open to everyone
+app.get("/api/quizzes", async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT quiz_id, topic_name, quiz_title, description FROM quizzes"
+  );
+  res.json(rows);
+});
+
+// Get one quiz with its questions (no correct answers included) — requires login
+app.get("/api/quizzes/:quizId", authenticateToken, async (req, res) => {
+  const { quizId } = req.params;
+
+  const [quizRows] = await pool.query("SELECT * FROM quizzes WHERE quiz_id = ?", [quizId]);
+  if (quizRows.length === 0) {
+    return res.status(404).json({ error: "Quiz not found" });
+  }
+
+  const [questionRows] = await pool.query(
+    `SELECT question_id, question_text, option_a, option_b, option_c, option_d
+     FROM quiz_questions
+     WHERE quiz_id = ?`,
+    [quizId]
+  );
+
+  res.json({ ...quizRows[0], questions: questionRows });
+});
+
+// Submit answers for a quiz and get scored
+app.post("/api/quizzes/:quizId/submit", authenticateToken, async (req, res) => {
+  const { quizId } = req.params;
+  const { answers } = req.body; // [{ question_id, selected_option }, ...]
+
+  if (!Array.isArray(answers) || answers.length === 0) {
+    return res.status(400).json({ error: "answers must be a non-empty array" });
+  }
+
+  const [questions] = await pool.query(
+    "SELECT question_id, correct_option FROM quiz_questions WHERE quiz_id = ?",
+    [quizId]
+  );
+
+  if (questions.length === 0) {
+    return res.status(404).json({ error: "Quiz not found or has no questions" });
+  }
+
+  const correctMap = {};
+  questions.forEach(q => { correctMap[q.question_id] = q.correct_option; });
+
+  let score = 0;
+
+  for (const answer of answers) {
+    const { question_id, selected_option } = answer;
+    const isCorrect = correctMap[question_id] === selected_option;
+    if (isCorrect) score++;
+
+    await pool.query(
+      "INSERT INTO quiz_answers (user_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?)",
+      [req.user.id, question_id, selected_option, isCorrect ? 1 : 0]
+    );
+  }
+
+  res.json({
+    quiz_id: Number(quizId),
+    totalQuestions: questions.length,
+    score,
+    percentage: Math.round((score / questions.length) * 100)
+  });
 });
 
 
@@ -134,97 +632,67 @@ app.get("/api/notes", authenticateToken, (req, res) => {
 // User Authentication
 // ======================
 
-// Register — always creates a regular "student" account.
-// (Admins are seeded separately, not created through this route.)
 app.post("/api/register", async (req, res) => {
-  const { email, password } = req.body;
+  const { full_name, username, email, password } = req.body;
 
-  const existing = users.find(user => user.email === email);
+  const [existing] = await pool.query(
+    "SELECT * FROM users WHERE email = ?",
+    [email]
+  );
 
-  if (existing) {
-    return res.status(400).json({
-      error: "User already exists"
-    });
+  if (existing.length > 0) {
+    return res.status(400).json({ error: "User already exists" });
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  const newUser = {
-    id: users.length + 1,
-    email,
-    password: hashedPassword,
-    role: "student"
-  };
-
-  users.push(newUser);
+  const [result] = await pool.query(
+    "INSERT INTO users (full_name, username, email, password, role) VALUES (?, ?, ?, ?, 'student')",
+    [full_name, username, email, hashedPassword]
+  );
 
   res.status(201).json({
-    id: newUser.id,
-    email: newUser.email,
-    role: newUser.role
+    id: result.insertId,
+    email,
+    role: "student"
   });
 });
 
-
-// Login
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
 
-  const user = users.find(user => user.email === email);
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE email = ?",
+    [email]
+  );
 
-  if (!user) {
-    return res.status(401).json({
-      error: "Invalid email or password"
-    });
+  if (rows.length === 0) {
+    return res.status(401).json({ error: "Invalid email or password" });
   }
 
+  const user = rows[0];
   const match = await bcrypt.compare(password, user.password);
 
   if (!match) {
-    return res.status(401).json({
-      error: "Invalid email or password"
-    });
+    return res.status(401).json({ error: "Invalid email or password" });
   }
 
   const token = jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      role: user.role
-    },
-    JWT_SECRET,
-    {
-      expiresIn: "1h"
-    }
+    { id: user.user_id, email: user.email, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: "1h" }
   );
 
-  res.json({
-    message: "Login successful",
-    token,
-    role: user.role
-  });
+  res.json({ message: "Login successful", token, role: user.role });
 });
 
 
 // ======================
-// Seed one admin account, then start the server
+// Start Server
 // ======================
 
-async function start() {
-  const adminPassword = await bcrypt.hash("admin123", 10);
+const PORT = 3000;
 
-  users.push({
-    id: 1,
-    email: "admin@noetra.com",
-    password: adminPassword,
-    role: "admin"
-  });
-
-  const PORT = 3000;
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log(`Seeded admin login -> email: admin@noetra.com | password: admin123`);
-  });
-}
-
-start();
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
