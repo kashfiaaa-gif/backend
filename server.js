@@ -365,22 +365,22 @@ app.delete("/api/resources/:resourceId", authenticateToken, requireAdmin, async 
 // ======================
 // Notes Routes
 // ======================
-
+ 
 app.post("/api/notes", authenticateToken, async (req, res) => {
   const { topic, content } = req.body;
-
+ 
   const [result] = await pool.query(
     "INSERT INTO notes (user_id, topic_name, note) VALUES (?, ?, ?)",
     [req.user.id, topic, content]
   );
-
+ 
   res.status(201).json({
     note_id: result.insertId,
     topic_name: topic,
     note: content
   });
 });
-
+ 
 app.get("/api/notes", authenticateToken, async (req, res) => {
   const [rows] = await pool.query(
     "SELECT * FROM notes WHERE user_id = ?",
@@ -388,24 +388,41 @@ app.get("/api/notes", authenticateToken, async (req, res) => {
   );
   res.json(rows);
 });
-
+ 
+// Edit one of the logged-in user's own notes
+app.put("/api/notes/:noteId", authenticateToken, async (req, res) => {
+  const { noteId } = req.params;
+  const { topic, content } = req.body;
+ 
+  const [result] = await pool.query(
+    "UPDATE notes SET topic_name = ?, note = ? WHERE note_id = ? AND user_id = ?",
+    [topic, content, noteId, req.user.id]
+  );
+ 
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+ 
+  res.json({ note_id: Number(noteId), topic_name: topic, note: content });
+});
+ 
 // Delete one of the logged-in user's own notes
 app.delete("/api/notes/:noteId", authenticateToken, async (req, res) => {
   const { noteId } = req.params;
-
+ 
   const [result] = await pool.query(
     "DELETE FROM notes WHERE note_id = ? AND user_id = ?",
     [noteId, req.user.id]
   );
-
+ 
   if (result.affectedRows === 0) {
     return res.status(404).json({ error: "Note not found" });
   }
-
+ 
   res.json({ message: "Note deleted" });
 });
-
-
+ 
+ 
 // ======================
 // Bookmark Routes
 // ======================
