@@ -5,10 +5,6 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
 const pool = require("./db");
-//ed
-const customizationRoutes = require("./routes/customization");
-const discussionRoutes = require("./routes/discussions");
-const ratingRoutes = require("./routes/ratings");
 
 const app = express();
 
@@ -565,6 +561,7 @@ app.post("/api/quizzes/:quizId/questions", authenticateToken, requireAdmin, asyn
   const { question_text, option_a, option_b, option_c, option_d, correct_option } = req.body;
 
   const [quizRows] = await pool.query("SELECT * FROM quizzes WHERE quiz_id = ?", [quizId]);
+
   if (quizRows.length === 0) {
     return res.status(404).json({ error: "Quiz not found" });
   }
@@ -592,6 +589,7 @@ app.get("/api/quizzes/:quizId", authenticateToken, async (req, res) => {
   const { quizId } = req.params;
 
   const [quizRows] = await pool.query("SELECT * FROM quizzes WHERE quiz_id = ?", [quizId]);
+
   if (quizRows.length === 0) {
     return res.status(404).json({ error: "Quiz not found" });
   }
@@ -615,8 +613,12 @@ app.post("/api/quizzes/:quizId/submit", authenticateToken, async (req, res) => {
     return res.status(400).json({ error: "answers must be a non-empty array" });
   }
 
+  // Pull question_text + all four options too, not just correct_option,
+  // so the frontend can render a full right/wrong review afterwards.
   const [questions] = await pool.query(
-    "SELECT question_id, correct_option FROM quiz_questions WHERE quiz_id = ?",
+    `SELECT question_id, question_text, option_a, option_b, option_c, option_d, correct_option
+     FROM quiz_questions
+     WHERE quiz_id = ?`,
     [quizId]
   );
 
@@ -624,29 +626,291 @@ app.post("/api/quizzes/:quizId/submit", authenticateToken, async (req, res) => {
     return res.status(404).json({ error: "Quiz not found or has no questions" });
   }
 
-  const correctMap = {};
-  questions.forEach(q => { correctMap[q.question_id] = q.correct_option; });
+  const questionMap = {};
+  questions.forEach(q => { questionMap[q.question_id] = q; });
 
   let score = 0;
+  const breakdown = []; // per-question result for the review screen
 
   for (const answer of answers) {
     const { question_id, selected_option } = answer;
-    const isCorrect = correctMap[question_id] === selected_option;
+    const question = questionMap[question_id];
+
+    if (!question) continue; // ignore answers for question ids that don't belong to this quiz
+
+    const isCorrect = question.correct_option === selected_option;
     if (isCorrect) score++;
 
     await pool.query(
       "INSERT INTO quiz_answers (user_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?)",
       [req.user.id, question_id, selected_option, isCorrect ? 1 : 0]
     );
+
+    breakdown.push({
+      question_id,
+      question_text: question.question_text,
+      option_a: question.option_a,
+      option_b: question.option_b,
+      option_c: question.option_c,
+      option_d: question.option_d,
+      selected_option: selected_option || null,
+      correct_option: question.correct_option,
+      is_correct: isCorrect
+    });
   }
 
   res.json({
     quiz_id: Number(quizId),
     totalQuestions: questions.length,
     score,
-    percentage: Math.round((score / questions.length) * 100)
+    percentage: Math.round((score / questions.length) * 100),
+    breakdown
   });
 });
+
+//ETU DUTTA
+const crypto = require("crypto");
+
+app.post("/api/forgot-password", async (req, res) => {
+  const { email } = req.body;
+
+  const [userRows] = await pool.query(
+    "SELECT * FROM users WHERE email = ?",
+    [email]
+  );
+
+  if (userRows.length === 0) {
+    return res.json({
+      message: "If that email exists, a reset link has been sent."
+    });
+  }
+
+  const user = userRows[0];
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+  await pool.query(
+    "INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)",
+    [user.user_id, token, expiresAt]
+  );
+
+  console.log(
+    `Password reset link for ${email}: http://localhost:3000/reset-password?token=${token}`
+  );
+
+  res.json({
+    message: "If that email exists, a reset link has been sent."
+  });
+});
+
+app.post("/api/reset-password", async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  const [resetRows] = await pool.query(
+    "SELECT * FROM password_resets WHERE token = ? AND used = FALSE",
+    [token]
+  );
+
+  if (resetRows.length === 0) {
+    return res.status(400).json({
+      error: "Invalid or expired reset link"
+    });
+  }
+
+  const reset = resetRows[0];
+
+  if (new Date(reset.expires_at) < new Date()) {
+    return res.status(400).json({
+      error: "Reset link has expired"
+    });
+  }
+
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+  await pool.query(
+    "UPDATE users SET password = ? WHERE user_id = ?",
+    [hashedPassword, reset.user_id]
+  );
+
+  await pool.query(
+    "UPDATE password_resets SET used = TRUE WHERE reset_id = ?",
+    [reset.reset_id]
+  );
+
+  res.json({
+    message: "Password updated successfully"
+  });
+});
+
+app.post("/api/resources/:resourceId/rating", authenticateToken, async (req, res) => {
+  const { resourceId } = req.params;
+  const { rating } = req.body;
+
+  if (rating < 1 || rating > 5) {
+    return res.status(400).json({
+      error: "Rating must be between 1 and 5"
+    });
+  }
+
+  await pool.query(
+    `INSERT INTO resource_ratings (resource_id, user_id, rating)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE rating = VALUES(rating)`,
+    [resourceId, req.user.id, rating]
+  );
+
+  res.json({
+    message: "Rating saved",
+    resourceId,
+    rating
+  });
+});
+
+app.get("/api/resources/:resourceId/rating", async (req, res) => {
+  const { resourceId } = req.params;
+
+  const [rows] = await pool.query(
+    `SELECT AVG(rating) AS average_rating,
+            COUNT(*) AS total_ratings
+     FROM resource_ratings
+     WHERE resource_id = ?`,
+    [resourceId]
+  );
+
+  res.json({
+    average_rating: rows[0].average_rating
+      ? Number(rows[0].average_rating).toFixed(1)
+      : null,
+    total_ratings: rows[0].total_ratings
+  });
+});
+
+app.post("/api/results/:resultId/discussions", authenticateToken, async (req, res) => {
+  const { resultId } = req.params;
+  const { message } = req.body;
+
+  const [result] = await pool.query(
+    "INSERT INTO discussions (result_id, user_id, message) VALUES (?, ?, ?)",
+    [resultId, req.user.id, message]
+  );
+
+  res.status(201).json({
+    post_id: result.insertId,
+    message
+  });
+});
+
+app.get("/api/results/:resultId/discussions", authenticateToken, async (req, res) => {
+  const { resultId } = req.params;
+
+  const [rows] = await pool.query(
+    `SELECT d.post_id,
+            d.message,
+            d.created_at,
+            u.username
+     FROM discussions d
+     JOIN users u ON d.user_id = u.user_id
+     WHERE d.result_id = ?
+     ORDER BY d.created_at ASC`,
+    [resultId]
+  );
+
+  res.json(rows);
+});
+
+app.delete("/api/discussions/:postId", authenticateToken, async (req, res) => {
+  const { postId } = req.params;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM discussions WHERE post_id = ?",
+    [postId]
+  );
+
+  if (rows.length === 0) {
+    return res.status(404).json({
+      error: "Post not found"
+    });
+  }
+
+  const post = rows[0];
+
+  if (
+    post.user_id !== req.user.id &&
+    req.user.role !== "admin"
+  ) {
+    return res.status(403).json({
+      error: "You can't delete this post"
+    });
+  }
+
+  await pool.query(
+    "DELETE FROM discussions WHERE post_id = ?",
+    [postId]
+  );
+
+  res.json({
+    message: "Post deleted"
+  });
+});
+
+app.post("/api/interests", authenticateToken, async (req, res) => {
+  const { interests } = req.body;
+
+  await pool.query(
+    "DELETE FROM user_interests WHERE user_id = ?",
+    [req.user.id]
+  );
+
+  for (const tag of interests) {
+    await pool.query(
+      "INSERT INTO user_interests (user_id, interest_tag) VALUES (?, ?)",
+      [req.user.id, tag]
+    );
+  }
+
+  res.json({
+    message: "Interests saved",
+    interests
+  });
+});
+
+app.post(
+  "/api/results/:resultId/tags",
+  authenticateToken,
+  requireAdmin,
+  async (req, res) => {
+    const { resultId } = req.params;
+    const { tag } = req.body;
+
+    await pool.query(
+      "INSERT INTO result_tags (result_id, tag) VALUES (?, ?)",
+      [resultId, tag]
+    );
+
+    res.status(201).json({
+      result_id: resultId,
+      tag
+    });
+  }
+);
+
+app.get("/api/suggestions", authenticateToken, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT DISTINCT sr.result_id, sr.topic_name
+     FROM saved_results sr
+     JOIN result_tags rt ON sr.result_id = rt.result_id
+     JOIN user_interests ui ON rt.tag = ui.interest_tag
+     WHERE ui.user_id = ?`,
+    [req.user.id]
+  );
+
+  res.json(rows);
+});
+
+
+
+
 
 //kashfia
 
@@ -712,9 +976,6 @@ app.post("/api/login", async (req, res) => {
 // ======================
 // Start Server
 // ======================
-app.use("/api", authenticateToken, customizationRoutes);
-app.use("/api", authenticateToken, discussionRoutes);
-app.use("/api", authenticateToken, ratingRoutes);
 
 const PORT = 3000;
 
