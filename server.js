@@ -128,6 +128,55 @@ app.put("/api/profile", authenticateToken, async (req, res) => {
   }
 });
 
+// ======================
+// Admin: List All Users (admin only)
+// Add this near your other Profile/User routes in server.js
+// ======================
+
+app.get("/api/users", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT user_id, full_name, username, email, role, created_at FROM users ORDER BY created_at DESC"
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Load users error:", err);
+    res.status(500).json({ error: "Could not load users." });
+  }
+});
+
+
+// ======================
+// Admin: List All Resources (admin only)
+// Add this near your other Resource routes in server.js
+//
+// NOTE: resources doesn't store topic_name itself - it's joined
+// in from saved_results via result_id, since admin.js expects
+// resource.topic_name on each row.
+// ======================
+
+app.get("/api/resources", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT resources.resource_id,
+              resources.resource_type,
+              resources.resource_title,
+              resources.resource_link,
+              resources.result_id,
+              saved_results.topic_name
+       FROM resources
+       JOIN saved_results ON resources.result_id = saved_results.result_id
+       ORDER BY resources.resource_id DESC`
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Load resources error:", err);
+    res.status(500).json({ error: "Could not load resources." });
+  }
+});
+
 
 // ======================
 // Roadmap Generator (no AI — matches against admin-curated topics)
